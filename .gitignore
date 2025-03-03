@@ -9,6 +9,9 @@ __pycache__/
 *.jpeg
 *.jpg_large
 
+#wandb
+wandb/
+
 # dataset
 *.grib
 *.idx

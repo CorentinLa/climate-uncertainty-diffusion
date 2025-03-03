@@ -2,8 +2,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
+import os
 
-def get_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.02):
+
+def get_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.008):
     return torch.linspace(beta_start, beta_end, timesteps)
 
 class ResidualBlock(nn.Module):
@@ -199,33 +202,38 @@ class DiffusionModel:
     """
     A diffusion model that learns to predict the residual (or noise) in latent space.
     """
-    def __init__(self, model, timesteps=1000, device=None):
+    def __init__(self, model, timesteps=1000, noise_scale=1.0, device=None):
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
         self.timesteps = timesteps
         self.betas = get_beta_schedule(timesteps).to(self.device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.noise_scale = noise_scale
 
-    # def add_noise(self, x0, t, noise=None):
-    #     """
-    #     x0: Original latent from the VAE.
-    #     t: A tensor of time steps (normalized between 0 and 1) of shape [B, 1].
-    #     noise: Optional noise tensor; if None, new Gaussian noise is generated.
-    #     Returns: (noisy latent, noise).
-    #     This version supports x0 with an arbitrary number of dimensions.
-    #     """
-    #     if noise is None:
-    #         noise = torch.randn_like(x0)
-    #     # Compute timestep indices for each sample in the batch.
-    #     t_idx = (t * self.timesteps).long().squeeze(1)  # shape [B]
-    #     t_idx = t_idx.clamp(max=self.timesteps - 1)
-    #     # Create a shape that will broadcast over every dimension of x0 except the batch dimension.
-    #     coeff_shape = [x0.size(0)] + [1] * (x0.dim() - 1)
-    #     sqrt_alphas_cumprod = self.alphas_cumprod[t_idx].sqrt().view(*coeff_shape)
-    #     sqrt_one_minus_alphas = (1 - self.alphas_cumprod[t_idx]).sqrt().view(*coeff_shape)
-    #     noisy_x = sqrt_alphas_cumprod * x0 + sqrt_one_minus_alphas * noise
-    #     return noisy_x, noise
+    def add_noise(self, x0, t, noise=None):
+        """
+        x0: Original residual (x0 - cond).
+        t: A tensor of time steps (normalized between 0 and 1) of shape [B, 1].
+        noise: Optional noise tensor; if None, new Gaussian noise is generated.
+        Returns: (noisy residual, noise).
+        """
+        if noise is None:
+            noise = torch.randn_like(x0) * self.noise_scale
+        
+        # Compute timestep indices for each sample in the batch
+        t_idx = (t * self.timesteps).long().squeeze(1)  # shape [B]
+        t_idx = t_idx.clamp(max=self.timesteps - 1)
+        
+        # Create a shape that will broadcast correctly
+        coeff_shape = [x0.size(0)] + [1] * (x0.dim() - 1)
+        
+        # Apply noise according to schedule
+        sqrt_alphas_cumprod = self.alphas_cumprod[t_idx].sqrt().view(*coeff_shape)
+        sqrt_one_minus_alphas = (1 - self.alphas_cumprod[t_idx]).sqrt().view(*coeff_shape)
+        
+        noisy_x = sqrt_alphas_cumprod * x0 + sqrt_one_minus_alphas * noise
+        return noisy_x, noise
 
     def train_step(self, optimizer, x0, cond):
         """
@@ -235,148 +243,142 @@ class DiffusionModel:
         """ 
         self.model.train()
         batch_size = x0.size(0)
+        
         # Sample random timesteps uniformly and scale them to [0,1]
         t = torch.randint(0, self.timesteps, (batch_size, 1), device=self.device).float() / self.timesteps
-        noise = x0 - cond
-
-        # merge T and C : [B, T, C, H, W] -> [B, T*C, H, W]
-        noise = noise.view(batch_size, -1, *noise.shape[-2:])
-        x0 = x0.view(batch_size, -1, *x0.shape[-2:])
+        
+        # Calculate residual
+        residual = x0 - cond
+        
+        # Reshape for model
+        residual = residual.view(batch_size, -1, *residual.shape[-2:])
         cond = cond.view(batch_size, -1, *cond.shape[-2:])
-
+        
+        # Add noise to the residual according to diffusion schedule
+        _, noise = self.add_noise(residual, t)
+        
+        # Model predicts the noise
         pred_noise = self.model(cond, t)
-        # Mean square error loss between true noise and predicted noise.
+        
+        # Loss between actual noise and predicted noise
         loss = F.mse_loss(pred_noise, noise)
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
         return loss.item()
 
     @torch.no_grad()
     def sample(self, cond, shape, num_steps=None):
         """
-        Generates a new latent sample given conditioning latent.
-
-        cond: Conditioning latent from the encoder.
-        shape: Shape of the latent tensor to generate (e.g. [B, C, H, W]).
-        num_steps: Optional number of inference steps. If None, use self.timesteps.
+        Modified diffusion sampling with controlled noise.
         """
         self.model.eval()
         batch_size = cond.size(0)
+        device = self.device
+        
         if num_steps is None:
-            num_steps = self.timesteps
-
-        # Start from random noise.
-        x = torch.randn(shape, device=self.device)
-        # Ensure cond is in expected shape: [B, C, H, W]
+            num_steps = min(100, self.timesteps)  # Use fewer steps by default
+        else:
+            num_steps = min(num_steps, self.timesteps)
+        
+        # Start with scaled-down noise - weather residuals have lower variance
+        x = torch.randn(shape, device=device) * self.noise_scale
         cond = cond.view(batch_size, -1, *cond.shape[-2:])
         
-        # Optionally, prepare a time schedule for fewer steps (here, we uniformly sample indices)
-        step_indices = torch.linspace(self.timesteps - 1, 0, steps=num_steps, dtype=torch.long, device=self.device)
+        # Use evenly spaced steps
+        step_indices = torch.linspace(0, self.timesteps-1, steps=num_steps, dtype=torch.long, device=device)
         
-        for i in step_indices:
-            t_val = i.float() / self.timesteps
-            t = torch.full((batch_size, 1), t_val, device=self.device)
-            pred_noise = self.model(cond, t)
+        # Perform reverse diffusion with gradual denoising
+        for i in range(num_steps-1, -1, -1):
+            index = step_indices[i]
             
-            beta = self.betas[i]
-            alpha = self.alphas[i]
-            alpha_cumprod = self.alphas_cumprod[i]
+            # Time embedding
+            t = (index / self.timesteps) * torch.ones((batch_size, 1), device=device)
             
-            # Compute the reverse diffusion formula components.
-            # Note: For numerical stability, we add a small epsilon (1e-8).
-            sqrt_recip_alpha = 1.0 / math.sqrt(alpha + 1e-8)
-            sqrt_one_minus_alpha_cumprod = math.sqrt(1 - alpha_cumprod + 1e-8)
+            # Get noise prediction
+            predicted_noise = self.model(cond, t)
             
-            # Predict the x0 (or target) and compute x_{t-1}
-            x = sqrt_recip_alpha * (x - beta / (sqrt_one_minus_alpha_cumprod + 1e-8) * pred_noise)
-            # if i > 0:
-            #     # Add noise, with variance = beta.
-            #     noise = torch.randn_like(x)
-            #     sigma = math.sqrt(beta)
-            #     x = x + sigma * noise
+            # Calculate coefficients
+            alpha = self.alphas[index]
+            alpha_cumprod = self.alphas_cumprod[index]
+            beta = self.betas[index]
+            
+            # For last few steps, reduce added noise for more coherent output
+            if i > 0:
+                # Progressively reduce noise as we approach final steps
+                noise_factor = min(1.0, i / (num_steps * 0.75))
+                noise = torch.randn_like(x) * noise_factor * self.noise_scale
+                next_index = step_indices[i-1]
+                next_alpha_cumprod = self.alphas_cumprod[next_index]
+            else:
+                noise = torch.zeros_like(x)
+                next_alpha_cumprod = torch.ones_like(alpha_cumprod)
+            
+            # Standard equation for reverse diffusion step
+            coefficient1 = 1 / alpha.sqrt()
+            coefficient2 = (1 - alpha) / (1 - alpha_cumprod).sqrt()
+            
+            # Update x using predicted noise
+            x = coefficient1 * (x - coefficient2 * predicted_noise)
+            
+            # Add controlled noise for the next step
+            if i > 0:
+                sigma = ((1 - next_alpha_cumprod) / (1 - alpha_cumprod) * beta).sqrt()
+                x = x + sigma * noise
+        
+        # Optional: apply a light smoothing filter to the final residual
+        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        
         return x
-
-import data_utils as du
-from torch.utils.data import DataLoader
-import variational_encoder as ve
-import utils
-from data_utils import plot_variables_from_image
-
-# Example usage:
-if __name__ == '__main__':
-
-        # Charger le dataset
-    dataset = du.open_grib_file("data.grib")
-
-    # Définir les paramètres de fenêtrage
-    window_size = 4  # Nombre d'étapes temporelles par fenêtre
-    overlap = 1       # Chevauchement entre fenêtres
-
-    # Initialiser le dataset
-    image_sequence_dataset = du.ImageSequenceDataset(
-        dataset=dataset,
-        window_size=window_size,
-        overlap=overlap,
-        variables=['t2m', 'sp', 'tcc'],
-        skip_last=True
-    )
     
-    # Initialiser le DataLoader
-    data_loader = DataLoader(
-        image_sequence_dataset,
-        batch_size=6,           # Nombre de fenêtres par batch
-        shuffle=True,           # Mélanger les données
-        num_workers=0,          # Nombre de workers pour le chargement des données
-        drop_last=True          # Ignorer les batches incomplets
-    )
+    @torch.no_grad()
+    def sample_ddim(self, cond, shape, num_steps=None):
+        """
+        Modified diffusion sampling with controlled noise.
+        """
+        self.model.eval()
+        batch_size = cond.size(0)
+        eta = 0.5  # 0 for deterministic sampling, 1.0 for stochastic
 
-    vae = ve.VAE()
+        if num_steps is None:
+            num_steps = min(100, self.timesteps)  # Use fewer steps by default
+        else:
+            num_steps = min(num_steps, self.timesteps)
+        step_indices = torch.round(torch.sqrt(torch.linspace(0, self.timesteps**2-1, 
+                                     steps=num_steps, device=self.device))).clamp(max=self.timesteps-1).long()
 
 
-    # Assume latent shape is [B, C, H, W]; for instance, [8, 4, 16, 16].
-    # Note: For the TemporalTransformer to work, in_channels must be divisible by transformer_time_steps.
-    latent_channels = 4   # Set transformer_time_steps so that latent_channels % transformer_time_steps == 0.
-    transformer_time_steps = 2*window_size  # For example, 4 channels split into 2 tokens (each of dimension 2).
-    
-    model = DiffusionUNet(in_channels=latent_channels*window_size, base_channels=192, time_emb_dim=128, transformer_time_steps=transformer_time_steps)
-    model.load_state_dict(torch.load("diffusion_model3.pt"))
-    diffusion = DiffusionModel(model, timesteps=1000, device='cuda')
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-    data_iter = iter(data_loader)
+        
+        
+        # Start with scaled-down noise - weather residuals have lower variance
+        x = torch.randn(shape, device=self.device) * self.noise_scale
+        cond = cond.view(batch_size, -1, *cond.shape[-2:])
+        for i in range(num_steps-1, -1, -1):
+            index = step_indices[i]
+            alpha_cumprod = self.alphas_cumprod[index]
+            
+            t = (index / self.timesteps) * torch.ones((batch_size, 1), device=self.device)
+            predicted_noise = self.model(cond, t)
+            
+            # Predict x0
+            x0_pred = (x - torch.sqrt(1-alpha_cumprod) * predicted_noise) / torch.sqrt(alpha_cumprod)
+            
+            if i > 0:
+                next_index = step_indices[i-1]
+                next_alpha_cumprod = self.alphas_cumprod[next_index]
+                
+                # Calculate sigma for stochasticity control
+                sigma = eta * torch.sqrt((1 - next_alpha_cumprod) / (1 - alpha_cumprod)) * torch.sqrt(1 - alpha_cumprod / next_alpha_cumprod)
+                
+                # DDIM update
+                c1 = torch.sqrt(next_alpha_cumprod)
+                c2 = torch.sqrt(1 - next_alpha_cumprod - sigma**2)
+                noise = torch.randn_like(x) * self.noise_scale if sigma > 0 else 0
+                x = c1 * x0_pred + c2 * predicted_noise + sigma * noise
+            else:
+                x = x0_pred  # Final step is deterministic
 
-    num_epochs = 0
-    for epoch in range(num_epochs):
-        for i, (x0, cond) in enumerate(data_loader):
-            x0 = x0.to('cuda')
-            cond = cond.to('cuda')
-            # Get latent representations from your VAE.
-            latent_seq = utils.encode_sequence_with_vae(vae, x0)
-            latent_cond = utils.encode_sequence_with_vae(vae, cond)
-
-            loss = diffusion.train_step(optimizer, latent_seq, latent_cond)
-            print(f"Epoch [{epoch+1}/{num_epochs}] Iteration [{i+1}/{len(data_loader)}]: Loss = {loss:.4f}")
-
-    # Sampling new latent residuals.
-    # cond_sample = torch.randn(8, latent_channels, 45, 90, device=diffusion.device)
-    # _, cond_sample = next(data_iter)
-    # cond_sample = cond_sample.to('cuda')
-    # latent_cond_sample = utils.encode_sequence_with_vae(vae, cond_sample).squeeze(0)
-
-    # save models
-    # torch.save(diffusion.model.state_dict(), "diffusion_model3.pt")
-    _, cond_sample = next(data_iter)
-    cond_sample = cond_sample.to('cuda')
-
-    latent_cond = utils.encode_sequence_with_vae(vae, cond_sample).squeeze(0)
-
-    sampled_latent = diffusion.sample(latent_cond, (4*latent_channels, 45, 90))
-
-    frames = utils.decode_sequence_with_vae(vae, latent_cond+sampled_latent.view(6, 4, latent_channels, 45, 90))
-    frames = frames[0]
-
-    frames = frames.permute(0, 2, 3, 1).cpu().numpy()
-    plot_variables_from_image(frames[0, :, :, :])
-
-    print("Sampling completed.")
+        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        return x

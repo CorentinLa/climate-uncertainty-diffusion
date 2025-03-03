@@ -30,7 +30,7 @@ class VAE():
     """
 
 
-    def __init__(self, config_path="latent-diffusion/models/first_stage_models/vq-f8-n256/config.yaml", checkpoint_path="model.ckpt", device='cuda'):
+    def __init__(self, config_path="latent-diffusion/models/first_stage_models/vq-f8-n256/config.yaml", checkpoint_path="/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/model.ckpt", device='cuda'):
         self.config_path = config_path  # Chemin du fichier config
         self.config = OmegaConf.load(config_path)
         self.checkpoint_path = checkpoint_path  # Chemin des poids du modèle
