@@ -36,7 +36,7 @@ class VAE():
         self.checkpoint_path = checkpoint_path  # Chemin des poids du modèle
         print(f"Loading model from {checkpoint_path}")
         self.model = instantiate_from_config(self.config.model)
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         self.model.load_state_dict(checkpoint["state_dict"], strict=False)
         self.model = self.model.to(device)
         self.model.eval()

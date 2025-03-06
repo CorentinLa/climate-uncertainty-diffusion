@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 from torch import tensor, float32
 from tqdm import tqdm
 import torch
-import utils
+import src.utils.utils as utils
 import json
 
 def open_grib_file(file_path, engine='cfgrib'):
@@ -297,7 +297,7 @@ class TestImageSequenceDataset(Dataset):
         self.variables = variables
         self.total_time = dataset.dims['time']
         # We only use the last simulation
-        self.sim_id = dataset.dims['number'] - 1
+        self.sim_id = dataset.dims['number'] - 2
         self.step = window_size - overlap
         self.num_windows = (self.total_time - overlap) // self.step
         self.time_indices = []

@@ -38,7 +38,7 @@ def device(func):
     )(func)
 
 
-def checkpoints(func, required=True):
+def checkpoints(func, required=False):
     return click.option(
         "--checkpoints",
         help="The path to the model checkpoints",

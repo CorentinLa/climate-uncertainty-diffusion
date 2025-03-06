@@ -37,6 +37,7 @@ def main():
 
 
 @main.command()
+@checkpoints
 @batch_size
 @device
 @epochs
@@ -71,6 +72,7 @@ def train(
     use_wandb: bool,
     run_name: str | None,
     run_id: str | None,
+    checkpoints: str | None,
 ):
     """Train Diffusion."""
 
@@ -80,7 +82,7 @@ def train(
             project="climate-uncertainty-diffusion",
             name=run_name,
             id=run_id,
-            resume="must",
+            resume="allow",
             config={
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
@@ -146,20 +148,21 @@ def train(
     )
     optimizer = torch.optim.Adam(diffusion.model.parameters(), lr=learning_rate)
 
-    if os.path.exists(
-        "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_model.pt"
-    ):
-        model.load_state_dict(
-            torch.load(
-                "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_model.pt"
+    if(checkpoints):
+        if os.path.exists(
+            f"/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_model.pt"
+        ):
+            model.load_state_dict(
+                torch.load(
+                    "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_model.pt"
+                )
             )
-        )
-        optimizer.load_state_dict(
-            torch.load(
-                "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_optimizer.pt"
+            optimizer.load_state_dict(
+                torch.load(
+                    "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_optimizer.pt"
+                )
             )
-        )
-        print("Model loaded.")
+            print("Model loaded.")
 
     
 
@@ -220,7 +223,7 @@ def test(
     n_simulations: int,
     compute_dataset_stats: bool,
 ):
-    """Train Diffusion."""
+    """Test Diffusion."""
     # Load the dataset
     dataset = du.open_grib_file(
         "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/dataset.grib"
