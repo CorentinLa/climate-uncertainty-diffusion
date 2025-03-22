@@ -9,12 +9,24 @@ import os
 def get_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.008):
     return torch.linspace(beta_start, beta_end, timesteps)
 
+def get_cosine_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.008):
+    """
+    Cosine schedule from 'Improved Denoising Diffusion Probabilistic Models'
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + 0.008) / 1.008 * math.pi / 2) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, beta_start, beta_end)
+
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_emb_dim):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
+
         self.res_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) \
                         if in_channels != out_channels else nn.Identity()
         self.norm1 = nn.GroupNorm(8, out_channels)
@@ -71,6 +83,68 @@ class TemporalTransformer(nn.Module):
         out = x_seq.contiguous().view(B, T * D, H, W)
         return out
 
+class SharedDiffusionTransformerBlock(nn.Module):
+    def __init__(self, channels_list, num_time_steps, num_heads=4):
+        super().__init__()
+        # Spatial transformer partagé (adaptable à différentes tailles)
+        self.spatial_transformer = nn.ModuleDict({
+            str(channels): SpatialTransformer(channels, num_heads=num_heads)
+            for channels in set(channels_list)
+        })
+        
+        # Temporal transformer partagé
+        self.temporal_transformer = nn.ModuleDict({
+            str(channels): TemporalTransformer(channels, num_time_steps, num_heads=num_heads)
+            for channels in set(channels_list)
+        })
+        
+        # MLPs partagés
+        self.mlp = nn.ModuleDict({
+            str(channels): nn.Sequential(
+                nn.LayerNorm(channels),
+                nn.Linear(channels, channels * 4),
+                nn.GELU(),
+                nn.Linear(channels * 4, channels)
+            )
+            for channels in set(channels_list)
+        })
+        
+        self.mlp2 = nn.ModuleDict({
+            str(channels): nn.Sequential(
+                nn.LayerNorm(channels),
+                nn.Linear(channels, channels * 4),
+                nn.GELU(),
+                nn.Linear(channels * 4, channels)
+            )
+            for channels in set(channels_list)
+        })
+    
+    def forward(self, x):
+        channels = x.shape[1]
+        channels_key = str(channels)
+        
+        residual = x
+        
+        # Apply shared spatial transformer
+        x = self.spatial_transformer[channels_key](x)
+        
+        # Apply shared MLP after spatial transformer
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, -1).transpose(1, 2)
+        x_mlp = self.mlp[channels_key](x_flat)
+        x = x + x_mlp.transpose(1, 2).view(B, C, H, W)
+        
+        # Apply shared temporal transformer
+        x = self.temporal_transformer[channels_key](x)
+        
+        # Apply shared MLP after temporal transformer
+        x_flat = x.view(B, C, -1).transpose(1, 2)
+        x_mlp2 = self.mlp2[channels_key](x_flat)
+        x = x + x_mlp2.transpose(1, 2).view(B, C, H, W)
+        
+        return x + residual
+
+# Curently not used
 class DiffusionTransformerBlock(nn.Module):
     def __init__(self, channels, num_time_steps, num_heads=4):
         super().__init__()
@@ -78,35 +152,74 @@ class DiffusionTransformerBlock(nn.Module):
         self.temporal_transformer = TemporalTransformer(channels, num_time_steps, num_heads)
         self.mlp = nn.Sequential(
             nn.LayerNorm(channels),
-            nn.Linear(channels, channels),
+            nn.Linear(channels, channels * 4),
             nn.GELU(),
-            nn.Linear(channels, channels)
+            nn.Linear(channels * 4, channels)
+        )
+
+        self.mlp2 = nn.Sequential(
+            nn.LayerNorm(channels),
+            nn.Linear(channels, channels * 4),
+            nn.GELU(),
+            nn.Linear(channels * 4, channels)
         )
         
     def forward(self, x):
         residual = x
+        
+        # Apply spatial transformer
         x = self.spatial_transformer(x)
-        x = self.temporal_transformer(x)
-        # Apply MLP per spatial location
+        
+        # Apply first MLP after spatial transformer
         B, C, H, W = x.shape
         x_flat = x.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
         x_mlp = self.mlp(x_flat)
-        x_mlp = x_mlp.transpose(1, 2).view(B, C, H, W)
-        return x + residual + x_mlp
+        x = x + x_mlp.transpose(1, 2).view(B, C, H, W)
+        
+        # Apply temporal transformer
+        x = self.temporal_transformer(x)
+        
+        # Apply second MLP after temporal transformer
+        x_flat = x.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
+        x_mlp2 = self.mlp2(x_flat)
+        x = x + x_mlp2.transpose(1, 2).view(B, C, H, W)
+        
+        # Add the original residual connection
+        return x + residual
+
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = t * embeddings.unsqueeze(0)
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        
+        # Projection layer pour atteindre la dimension complète si impaire
+        if self.dim % 2 == 1:
+            embeddings = F.pad(embeddings, (0, 1, 0, 0))
+        
+        return embeddings
 
 class DiffusionUNet(nn.Module):
     def __init__(self, in_channels, base_channels=64, time_emb_dim=128, transformer_time_steps=2):
         super().__init__()
 
         # Time embedding network
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_emb_dim),
-            nn.ReLU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
+        self.time_embed = nn.Sequential(
+    SinusoidalTimeEmbedding(time_emb_dim),
+    nn.Linear(time_emb_dim, time_emb_dim * 4),
+    nn.SiLU(),
+    nn.Linear(time_emb_dim * 4, time_emb_dim)
         )
 
         # Down-sampling (encoder) blocks
-        self.down1 = ResidualBlock(in_channels, base_channels, time_emb_dim)        # (45x90)
+        self.down1 = ResidualBlock(in_channels*2, base_channels, time_emb_dim)        # (45x90)
         self.down2 = ResidualBlock(base_channels, base_channels * 2, time_emb_dim)    # (23x45)
         self.down3 = ResidualBlock(base_channels * 2, base_channels * 4, time_emb_dim)  # (12x23)
         self.down4 = ResidualBlock(base_channels * 4, base_channels * 8, time_emb_dim)  # (6x12)
@@ -114,10 +227,17 @@ class DiffusionUNet(nn.Module):
         # Pooling for resolution reduction
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True)  # Handles odd sizes
 
-        # Cascaded Transformers at different levels
-        self.transformer_low = DiffusionTransformerBlock(base_channels * 8, num_time_steps=transformer_time_steps, num_heads=4)   # 3x6 resolution
-        self.transformer_mid = DiffusionTransformerBlock(base_channels * 4, num_time_steps=transformer_time_steps, num_heads=4)   # 6x12 resolution
-        self.transformer_high = DiffusionTransformerBlock(base_channels * 2, num_time_steps=transformer_time_steps, num_heads=4)  # 12x23 resolution
+        # # Cascaded Transformers at different levels
+        # self.transformer_low = DiffusionTransformerBlock(base_channels * 8, num_time_steps=transformer_time_steps, num_heads=4)   # 3x6 resolution
+        # self.transformer_mid = DiffusionTransformerBlock(base_channels * 4, num_time_steps=transformer_time_steps, num_heads=4)   # 6x12 resolution
+        # self.transformer_high = DiffusionTransformerBlock(base_channels * 2, num_time_steps=transformer_time_steps, num_heads=4)  # 12x23 resolution
+        
+        channels_to_use = [base_channels*8, base_channels*4, base_channels*2]
+        self.shared_transformer = SharedDiffusionTransformerBlock(
+            channels_list=channels_to_use, 
+            num_time_steps=transformer_time_steps,
+            num_heads=4
+        )
 
         # Up-sampling (decoder) blocks
         self.up1 = ResidualBlock(base_channels * 8, base_channels * 4, time_emb_dim)  # (3x6) -> (6x12)
@@ -149,7 +269,7 @@ class DiffusionUNet(nn.Module):
         x: Noisy latent tensor of shape [B, C, H, W].
         t: Time tensor of shape [B, 1], values scaled between 0 and 1.
         """
-        t_emb = self.time_mlp(t)  # Compute time embedding
+        t_emb = self.time_embed(t)  # Compute time embedding
 
         # Encoder path
         h1 = self.down1(x, t_emb)       # (45x90)
@@ -162,7 +282,8 @@ class DiffusionUNet(nn.Module):
         h = self.pool(h4)               # (3x6)
 
         # Transformer at the lowest level (long-term dependencies)
-        h = self.transformer_low(h)
+        # h = self.transformer_low(h)
+        h = self.shared_transformer(h)
 
         # Decoder path
         h = self.upsample(h)  # From (3x6) to (6x12)
@@ -171,7 +292,8 @@ class DiffusionUNet(nn.Module):
         if up1.shape[-2:] != proj_h4.shape[-2:]:
             up1 = self.center_crop(up1, proj_h4.shape[-2:])
         h = up1 + proj_h4
-        h = self.transformer_mid(h)
+        # h = self.transformer_mid(h)
+        h = self.shared_transformer(h)
 
         h = self.upsample(h)  # Expected (12x23) but might be (12x24)
         up2 = self.up2(h, t_emb)
@@ -179,7 +301,8 @@ class DiffusionUNet(nn.Module):
         if up2.shape[-2:] != proj_h3.shape[-2:]:
             up2 = self.center_crop(up2, proj_h3.shape[-2:])
         h = up2 + proj_h3
-        h = self.transformer_high(h)
+        # h = self.transformer_high(h)
+        h = self.shared_transformer(h)
 
         h = self.upsample(h)  # (23x45)
         up3 = self.up3(h, t_emb)
@@ -206,7 +329,7 @@ class DiffusionModel:
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
         self.timesteps = timesteps
-        self.betas = get_beta_schedule(timesteps).to(self.device)
+        self.betas = get_cosine_beta_schedule(timesteps).to(self.device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.noise_scale = noise_scale
@@ -231,7 +354,7 @@ class DiffusionModel:
         # Apply noise according to schedule
         sqrt_alphas_cumprod = self.alphas_cumprod[t_idx].sqrt().view(*coeff_shape)
         sqrt_one_minus_alphas = (1 - self.alphas_cumprod[t_idx]).sqrt().view(*coeff_shape)
-        
+            
         noisy_x = sqrt_alphas_cumprod * x0 + sqrt_one_minus_alphas * noise
         return noisy_x, noise
 
@@ -255,10 +378,10 @@ class DiffusionModel:
         cond = cond.view(batch_size, -1, *cond.shape[-2:])
         
         # Add noise to the residual according to diffusion schedule
-        _, noise = self.add_noise(residual, t)
+        noisy_residual, noise = self.add_noise(residual, t)
         
         # Model predicts the noise
-        pred_noise = self.model(cond, t)
+        pred_noise = self.model(torch.cat([noisy_residual, cond], dim=1), t)
         
         # Loss between actual noise and predicted noise
         loss = F.mse_loss(pred_noise, noise)
@@ -270,70 +393,84 @@ class DiffusionModel:
         return loss.item()
 
     @torch.no_grad()
-    def sample(self, cond, shape, num_steps=None):
+    def sample_residual(self, cond, num_steps=100):
         """
-        Modified diffusion sampling with controlled noise.
+        Generate a residual from noise, conditioned on the input.
+        
+        Args:
+            cond: Conditioning latent [B, C, H, W]
+            num_steps: Number of denoising steps
+        
+        Returns:
+            residual: Generated residual
+            output: Final output (condition + residual)
         """
         self.model.eval()
         batch_size = cond.size(0)
         device = self.device
         
-        if num_steps is None:
-            num_steps = min(100, self.timesteps)  # Use fewer steps by default
-        else:
-            num_steps = min(num_steps, self.timesteps)
+        # Limit steps to max timesteps
+        num_steps = min(num_steps, self.timesteps)
         
-        # Start with scaled-down noise - weather residuals have lower variance
-        x = torch.randn(shape, device=device) * self.noise_scale
+        # Prepare condition and shape for residual
         cond = cond.view(batch_size, -1, *cond.shape[-2:])
+        shape = cond.shape  # Residual has same shape as condition
         
-        # Use evenly spaced steps
+        # Start with pure noise for residual
+        residual = torch.randn(shape, device=device) 
+        
+        # Use sqrt spacing for better quality with fewer steps
         step_indices = torch.linspace(0, self.timesteps-1, steps=num_steps, dtype=torch.long, device=device)
         
-        # Perform reverse diffusion with gradual denoising
+        # Reverse diffusion process
         for i in range(num_steps-1, -1, -1):
             index = step_indices[i]
             
             # Time embedding
             t = (index / self.timesteps) * torch.ones((batch_size, 1), device=device)
             
-            # Get noise prediction
-            predicted_noise = self.model(cond, t)
+            # Combine noisy residual with condition
+            model_input = torch.cat([residual, cond], dim=1)
+            
+            # Predict noise
+            predicted_noise = self.model(model_input, t) * self.noise_scale
             
             # Calculate coefficients
             alpha = self.alphas[index]
             alpha_cumprod = self.alphas_cumprod[index]
             beta = self.betas[index]
             
-            # For last few steps, reduce added noise for more coherent output
+            # Apply denoising step
             if i > 0:
-                # Progressively reduce noise as we approach final steps
+                # Progressive noise reduction
                 noise_factor = min(1.0, i / (num_steps * 0.75))
-                noise = torch.randn_like(x) * noise_factor * self.noise_scale
+                noise = torch.randn_like(residual) * noise_factor * self.noise_scale
                 next_index = step_indices[i-1]
                 next_alpha_cumprod = self.alphas_cumprod[next_index]
             else:
-                noise = torch.zeros_like(x)
+                noise = torch.zeros_like(residual)
                 next_alpha_cumprod = torch.ones_like(alpha_cumprod)
             
-            # Standard equation for reverse diffusion step
+            # reverse diffusion step
             coefficient1 = 1 / alpha.sqrt()
             coefficient2 = (1 - alpha) / (1 - alpha_cumprod).sqrt()
             
-            # Update x using predicted noise
-            x = coefficient1 * (x - coefficient2 * predicted_noise)
+            # Update residual using predicted noise
+            residual = coefficient1 * (residual - coefficient2 * predicted_noise)
             
             # Add controlled noise for the next step
             if i > 0:
                 sigma = ((1 - next_alpha_cumprod) / (1 - alpha_cumprod) * beta).sqrt()
-                x = x + sigma * noise
+                residual = residual + sigma * noise
+         
+        # Light smoothing filter for final result
+        # residual = F.avg_pool2d(residual, kernel_size=3, stride=1, padding=1)
         
-        # Optional: apply a light smoothing filter to the final residual
-        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
         
-        return x
+        return residual
     
     @torch.no_grad()
+    # Warning : not updated to latest code
     def sample_ddim(self, cond, shape, num_steps=None):
         """
         Modified diffusion sampling with controlled noise.

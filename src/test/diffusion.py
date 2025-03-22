@@ -35,11 +35,16 @@ def test_diffusion(diffusion, vae, data_loader, device, window_size, latent_chan
             latent_cond = utils.encode_sequence_with_vae(vae, cond)
 
             # Sample from the diffusion model
-            sampled_latent = diffusion.sample(latent_cond, (window_size*latent_channels, 45, 90))
+            sampled_latent = diffusion.sample_residual(latent_cond)
 
             # Decode the sampled latent
             gen_recon = utils.decode_sequence_with_vae(vae, latent_cond+sampled_latent.view(cond.shape[0], window_size, latent_channels, 45, 90)) # (batch, T, 3, H, W)
-
+            
+            if i == 0:
+                utils.plot_variables_from_image(
+            gen_recon.permute(0, 1, 3, 4, 2).cpu()[0, 0, :, :, :], 
+            output_path=f"/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/data/results/diffusion/sampled_frames_test.png"
+            )
             # Free memory after each step
             del cond, latent_cond, sampled_latent
             torch.cuda.empty_cache()

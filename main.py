@@ -129,7 +129,7 @@ def train(
 
     # Initialiser le modèle de diffusion
     transformer_time_steps = (
-        2  # For example, 4 channels split into 2 tokens (each of dimension 2).
+        4  # For example, 4 channels split into 2 tokens (each of dimension 2).
     )
 
     assert (
@@ -146,7 +146,7 @@ def train(
     diffusion = DiffusionModel(
         model, timesteps=1000, noise_scale=noise_scale, device=device
     )
-    optimizer = torch.optim.Adam(diffusion.model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(diffusion.model.parameters(), lr=learning_rate, weight_decay=0.01)
 
     if(checkpoints):
         if os.path.exists(
@@ -258,7 +258,7 @@ def test(
 
     # Initialiser le modèle de diffusion
     transformer_time_steps = (
-        2  # For example, 4 channels split into 2 tokens (each of dimension 2).
+        4  # For example, 4 channels split into 2 tokens (each of dimension 2).
     )
 
     assert (

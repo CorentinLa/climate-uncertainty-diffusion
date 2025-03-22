@@ -8,7 +8,6 @@ def train_diffusion(diffusion, vae, optimizer, train_loader, device, run, num_ep
             x0 = x0.to(device)
             cond = cond.to(device)
 
-            # Get latent representations from your VAE.
             latent_seq = utils.encode_sequence_with_vae(vae, x0)
             latent_cond = utils.encode_sequence_with_vae(vae, cond)
 
@@ -26,7 +25,7 @@ def train_diffusion(diffusion, vae, optimizer, train_loader, device, run, num_ep
 
         torch.save(diffusion.model.state_dict(), "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_model.pt")
         torch.save(optimizer.state_dict(), "/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/checkpoints/diffusion_optimizer.pt")
-
+        
         # Generate sample visualization only at end of epoch
         data_iter = iter(train_loader)  # Reset iterator
         utils.sample_and_visualize(epoch, diffusion, vae, data_iter, window_size, latent_channels, device, run)

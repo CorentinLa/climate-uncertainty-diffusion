@@ -216,6 +216,7 @@ class ImageSequenceDataset(Dataset):
             end = min(start + window_size, self.total_time)
             self.conditionner.append((start, end))
 
+
         # Preload all data into memory
         print("Preloading all data into memory - this may take a moment...")
         
@@ -230,7 +231,7 @@ class ImageSequenceDataset(Dataset):
         
         # Preprocess all frames for all simulations
         self.preprocessed_frames = {}
-        for sim_id in tqdm(range(self.number_sim + 1), desc="Preprocessing frames"):  # Include validation sim
+        for sim_id in tqdm(range(self.number_sim + 1 + 1), desc="Preprocessing frames"):  # Include validation sim
             self.preprocessed_frames[sim_id] = []
             for t in range(self.total_time):
                 # Create normalized image for this frame
@@ -277,7 +278,7 @@ class ImageSequenceDataset(Dataset):
         # Stack and convert to tensor
         frames_cond = np.stack(frames_cond, axis=0)
         frames_cond = tensor(frames_cond, dtype=float32).permute(0, 3, 1, 2)  # (T, 3, H, W)
-        
+
         return frames, frames_cond
 
 
@@ -350,5 +351,4 @@ class TestImageSequenceDataset(Dataset):
         frames = np.stack(frames, axis=0)
         frames = tensor(frames, dtype=float32).permute(0, 3, 1, 2)  # (T, 3, H, W)
         
-        # Return frames and the start time index
         return frames, start_time

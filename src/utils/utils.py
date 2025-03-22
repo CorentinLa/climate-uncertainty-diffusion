@@ -43,18 +43,15 @@ def sample_and_visualize(epoch, diffusion, vae, data_iter, window_size, latent_c
     # Free cache first
     torch.cuda.empty_cache()
     
-    # Process a smaller batch for visualization (just 8 samples)
     try:
         truth_sample, cond_sample = next(data_iter)
-        # Only use a subset of the batch
         truth_sample = truth_sample[:8].to(device)
         cond_sample = cond_sample[:8].to(device)
         
         latent_truth = encode_sequence_with_vae(vae, truth_sample).squeeze(0)
         latent_cond = encode_sequence_with_vae(vae, cond_sample).squeeze(0)
         
-        # Sample with reduced steps for memory efficiency
-        sampled_latent = diffusion.sample(latent_cond, (window_size*latent_channels, 45, 90))
+        sampled_latent = diffusion.sample_residual(latent_cond)
 
         # Process only one sample for visualization
         sample_idx = 0
@@ -124,7 +121,6 @@ def sample_and_visualize(epoch, diffusion, vae, data_iter, window_size, latent_c
             output_path=f"/home/ensta/ensta-lachevre/climate-uncertainty-diffusion/data/results/diffusion/sampled_frames_{epoch}.png"
         )
         
-        # Explicitly delete tensors and call garbage collector
         del truth_sample, cond_sample, latent_truth, latent_cond, sampled_latent
         del truth_recon, cond_recon, gen_recon, truth_frame, cond_frame, gen_frame
         import gc
