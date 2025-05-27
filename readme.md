@@ -2,7 +2,7 @@
 
 Based on the paper [Latent Diffusion Model for Generating Ensembles of Climate Simulations](https://arxiv.org/abs/2407.02070)
 
-This repository gives a possible implementation for the paper, using ERA5 dataset.
+This repository gives a possible implementation from scratch for the paper, using ERA5 dataset.
 
 ## Quickstart
 
